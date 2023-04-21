@@ -5,12 +5,15 @@ import os
 import json
 data_path = 'data'
 
+from typing import List, Dict, Union, Tuple, Any
+
 #Data
 from torch.utils.data import Dataset, DataLoader # type: ignore
 from PIL import Image
 
 #Modeling
 import torch # type: ignore
+
 
 
 
@@ -55,7 +58,51 @@ class DataTools:
         return chart_type, x_series, y_series
     
     @staticmethod
+    def s2n(self, x):
+
+        try:
+            x = float(x)
+
+        except:
+            x = x
+
+        return x
+    
+    @staticmethod
+    def round_float(self,value: Union[int, float, str]) -> Union[str, float]:
+        """
+        Convert a float value to a string with the specified number of decimal places. 
+        If there is more than 1 digit in the integer, then we will truncate to 1 decimal.
+        Otherwise, will truncate to 4 decimals.
+
+        Args:
+            value (int, float, str): The float value to convert
+
+        Returns:
+            str: The rounded float value as a string
+        """
+        if isinstance(value, int|float):
+            value = str(value)
+
+            if "." in value:
+                integer, decimal = value.split(".")
+                if abs(float(integer)) > 1:
+                    decimal = decimal[:2]
+                else:
+                    decimal = decimal[:4]
+
+                value = integer + "." + decimal
+            
+        return value
+    
+    @staticmethod
     def textify(self,chart_type, x_series, y_series, task = 'classify'):
+        x_series = 'x series: ' + ';'.join([self.round_float(x) for x in x_series])
+        y_series = 'y series: ' + ';'.join([self.round_float(y) for y in y_series])
+        chart_type = 'Chart type: ' + chart_type
+        full_output = chart_type + '|' + x_series + '|' + y_series
+
+
         if task == 'classify':
             return chart_type
         
@@ -66,7 +113,26 @@ class DataTools:
             return y_series
         
         elif task == 'full_output':
-            return f'{chart_type} {x_series} {y_series}'
+            return full_output
+        
+        else:
+            raise ValueError('Task must be either classify, extract_x, extract_y or full_output')
+        
+    @staticmethod
+    def numerify(self, answer: str):
+        series = answer.split(';')
+        series = [self.s2n(x) for x in series]
+        return series
+    
+    @staticmethod
+    def get_image(self, img_path, b_w = True):
+        
+        if b_w:
+            img = Image.open(img_path).convert('L')
+        else:
+            img = Image.open(img_path).convert('RGB')
+
+        return img
 
     def build_dataset(self, 
                       stage: str = 'dev', 
