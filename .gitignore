@@ -3,3 +3,7 @@
 /DS_Store
 .DS_Store
 /data/
+.ipynb_checkpoints
+/data_to_train/
+aux_nbs.py
+__pycache__/
