@@ -15,7 +15,7 @@ from PIL import Image
 import torch # type: ignore
 
 
-
+###### DATA PROCESSING ########
 
 
 class DataConfig:
@@ -43,22 +43,22 @@ class DataTools:
 
     #Load annotations
     @staticmethod
-    def load_json(self,path):
+    def load_json(path):
         with open(path, 'r') as f:
             data = json.load(f)
         return data
     
     #Transform data series into appropriate format
     @staticmethod
-    def transform_data_series(self, annotations: dict):
-        chart_type = annotations['chart_type']
-        data_series = annotations['data_series']
+    def transform_data_series(annotations: dict):
+        chart_type = annotations['chart-type']
+        data_series = annotations['data-series']
         x_series = [v['x'] for v in data_series]
         y_series = [v['y'] for v in data_series]
         return chart_type, x_series, y_series
     
     @staticmethod
-    def s2n(self, x):
+    def s2n(x):
 
         try:
             x = float(x)
@@ -69,7 +69,7 @@ class DataTools:
         return x
     
     @staticmethod
-    def round_float(self,value: Union[int, float, str]) -> Union[str, float]:
+    def round_float(value: Union[int, float, str]) -> Union[str, float]:
         """
         Convert a float value to a string with the specified number of decimal places. 
         If there is more than 1 digit in the integer, then we will truncate to 1 decimal.
@@ -94,13 +94,12 @@ class DataTools:
                 value = integer + "." + decimal
             
         return value
-    
     @staticmethod
-    def textify(self,chart_type, x_series, y_series, task = 'classify'):
-        x_series = 'x series: ' + ';'.join([self.round_float(x) for x in x_series])
-        y_series = 'y series: ' + ';'.join([self.round_float(y) for y in y_series])
-        chart_type = 'Chart type: ' + chart_type
-        full_output = chart_type + '|' + x_series + '|' + y_series
+    def textify(chart_type, x_series, y_series, task = 'classify'):
+        x_series = 'x_series:' + ';'.join([DataTools.round_float(x) for x in x_series])
+        y_series = 'y_series:' + ';'.join([DataTools.round_float(y) for y in y_series])
+        chart_type = 'chart_type:' + chart_type
+        full_output = chart_type + ' ' + x_series + ' ' + y_series
 
 
         if task == 'classify':
@@ -117,15 +116,15 @@ class DataTools:
         
         else:
             raise ValueError('Task must be either classify, extract_x, extract_y or full_output')
-        
+    
     @staticmethod
-    def numerify(self, answer: str):
+    def numerify(answer: str):
         series = answer.split(';')
-        series = [self.s2n(x) for x in series]
+        series = [DataTools.s2n(x) for x in series]
         return series
     
     @staticmethod
-    def get_image(self, img_path, b_w = True):
+    def get_image(img_path, b_w = True):
         
         if b_w:
             img = Image.open(img_path).convert('L')
@@ -219,6 +218,49 @@ class DataTools:
         
         
         return dataset
+    
+    
+    @staticmethod
+    def pix2struct_collator(batch, processor):
+        """Colator for the 'pix2struct base' model
+        """
+        new_batch = {"flattened_patches":[], "attention_mask":[]}
+        texts = [item["text"] for item in batch]
+        
+        text_inputs = processor(text=texts, 
+                                     padding="max_length", 
+                                     return_tensors="pt", 
+                                     add_special_tokens=True, 
+                                     max_length=20)
+        
+        new_batch["labels"] = text_inputs.input_ids
+        
+        for item in batch:
+            new_batch["flattened_patches"].append(item["flattened_patches"])
+            new_batch["attention_mask"].append(item["attention_mask"])
+        
+        new_batch["flattened_patches"] = torch.stack(new_batch["flattened_patches"])
+        new_batch["attention_mask"] = torch.stack(new_batch["attention_mask"])
+
+        return new_batch
+    
+    @staticmethod
+    def blip_collator(batch, processor):
+        """Colator for the 'blip2-opt-2.7b' model
+        """
+        # pad the input_ids and attention_mask
+        processed_batch = {}
+        for key in batch[0].keys():
+            if key != "text":
+                processed_batch[key] = torch.stack([example[key] for example in batch])
+            else:
+                text_inputs = processor.tokenizer(
+                    [example["text"] for example in batch], padding=True, return_tensors="pt"
+                )
+                processed_batch["input_ids"] = text_inputs["input_ids"]
+                processed_batch["attention_mask"] = text_inputs["attention_mask"]
+        return processed_batch
+
 
 class BenetechDataset(Dataset):
     def __init__(self, 
@@ -252,11 +294,131 @@ class BenetechDataset(Dataset):
         
         encoding = {k:v.squeeze() for k,v in encoding.items()}
 
-        annotations = self.load_json(item["annotations_path"])
-        chart_type, x_series, y_series = self.transform_data_series(annotations)
+        annotations = DataTools.load_json(item["annotations_path"])
+        chart_type, x_series, y_series = DataTools.transform_data_series(annotations)
 
         text = DataTools.textify(chart_type, x_series, y_series, task=self.task)
 
         encoding["text"] = text
         
         return encoding
+    
+
+
+##### MODELING #####
+
+class CaptionGenerator:
+    def __init__(self, 
+                 model_architecture: str = "Salesforce/blip2-opt-2.7b",
+                 lora_config: dict = {'r':8, 'lora_alpha':32, 'lora_dropout': 0.0, 'bias': None},
+                 model_config: dict = None,
+                 device:str = 'cuda',
+                 optimizer_info:dict = {'name':'AdamW', 'lr': 5e-5, 'weight_decay': 0.01, 'eps': 1e-8},
+                 source: str = 'pretrained',
+                 task: str = 'full_output',
+                 load_in_8bit: bool = True):
+
+        self.device = device
+        self.task = task
+        self.model_architecture = model_architecture
+        self.source = source
+        self.load_in_8bit = load_in_8bit
+        self.optmizer_info = optimizer_info
+
+        if model_architecture == "Salesforce/blip2-opt-2.7b":
+            self.collator = DataTools.blip_collator
+
+        from peft import LoraConfig
+
+
+        if lora_config is not None:
+            self.config = LoraConfig(**lora_config)
+
+        if model_config is not None:
+            self.config = model_config
+
+    def load_model(self):
+        from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+        from peft import get_peft_model
+
+        quantization_config = BitsAndBytesConfig(llm_int8_enable_fp32_cpu_offload=True)
+
+
+        if self.source == 'pretrained':
+            model = AutoModelForVision2Seq.from_pretrained(self.model_architecture, 
+                                                           load_in_8bit=self.load_in_8bit,
+                                                           device_map = 'auto')
+            
+            processor = AutoProcessor.from_pretrained(self.model_architecture)
+
+        self.model = get_peft_model(model, self.config)
+        self.processor = processor
+        self.model.print_trainable_parameters()
+
+        if self.optimizer['name'] == 'AdamW':
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.optimizer['lr'])
+        
+        return
+
+class ModelExperiment:
+    def __init__(self, 
+                 experiment_name: str, 
+                 data_config: DataConfig, 
+                 use_wandb: bool = False):
+
+        self.experiment_name = experiment_name
+        self.data_config = data_config
+        self.use_wandb = use_wandb
+        self.training_outputs = None
+
+    def train_model(self, 
+                    generator: CaptionGenerator, 
+                    train_dataset: list, 
+                    epochs: int = 10,
+                    batch_size: int = 2):
+        
+        if generator.model is None:
+            generator.load_model()
+        
+        generator.model.train()
+
+        train_dataset = BenetechDataset(processor = generator.processor,
+                                        dataset = train_dataset,
+                                        data_config = self.data_config,
+                                        task = generator.task,
+                                        stage = 'train')
+        
+        train_dataloader = DataLoader(train_dataset, 
+                                      shuffle=True, 
+                                      batch_size=batch_size, 
+                                      collate_fn=generator.collator)
+                
+        for epoch in range(epochs):
+            print("Epoch:", epoch)
+            for idx, batch in enumerate(train_dataloader):
+                input_ids = batch.pop("input_ids").to(generator.device)
+                pixel_values = batch.pop("pixel_values").to(generator.device, torch.float16)
+
+                outputs = generator.model(input_ids=input_ids, pixel_values=pixel_values, labels=input_ids)
+
+                loss = outputs.loss
+
+                print("Loss:", loss.item())
+
+                loss.backward()
+
+                generator.optimizer.step()
+                generator.optimizer.zero_grad()
+
+                if idx % 1000 == 0:
+                    generated_output = generator.model.generate(pixel_values=pixel_values)
+                    print(train_dataset.processor.batch_decode(generated_output, skip_special_tokens=True))
+
+        return
+        
+    
+    @staticmethod
+    def evaluate_predictions():
+        return
+
+    
