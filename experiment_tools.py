@@ -6,6 +6,8 @@ import json
 data_path = 'data'
 
 from typing import List, Dict, Union, Tuple, Any
+from functools import partial
+import numpy as np
 
 #Data
 from torch.utils.data import Dataset, DataLoader # type: ignore
@@ -95,10 +97,10 @@ class DataTools:
             
         return value
     @staticmethod
-    def textify(chart_type, x_series, y_series, task = 'classify'):
-        x_series = 'x_series:' + ';'.join([DataTools.round_float(x) for x in x_series])
-        y_series = 'y_series:' + ';'.join([DataTools.round_float(y) for y in y_series])
-        chart_type = 'chart_type:' + chart_type
+    def textify(chart_type, x_series, y_series, task = 'full_output'):
+        x_series = 'x axis: ' + ', '.join([DataTools.round_float(x) for x in x_series])
+        y_series = 'y axis: ' + ', '.join([DataTools.round_float(y) for y in y_series])
+        chart_type = 'Chart type: ' + ' '.join(chart_type.split('_'))
         full_output = chart_type + ' ' + x_series + ' ' + y_series
 
 
@@ -221,17 +223,18 @@ class DataTools:
     
     
     @staticmethod
-    def pix2struct_collator(batch, processor):
+    def pix2struct_collator(processor, batch):
         """Colator for the 'pix2struct base' model
         """
         new_batch = {"flattened_patches":[], "attention_mask":[]}
         texts = [item["text"] for item in batch]
         
         text_inputs = processor(text=texts, 
-                                     padding="max_length", 
-                                     return_tensors="pt", 
-                                     add_special_tokens=True, 
-                                     max_length=20)
+                                padding="max_length", 
+                                return_tensors="pt", 
+                                add_special_tokens=True, 
+                                #truncation=True,
+                                max_length=100)
         
         new_batch["labels"] = text_inputs.input_ids
         
@@ -242,10 +245,11 @@ class DataTools:
         new_batch["flattened_patches"] = torch.stack(new_batch["flattened_patches"])
         new_batch["attention_mask"] = torch.stack(new_batch["attention_mask"])
 
+
         return new_batch
     
     @staticmethod
-    def blip_collator(batch, processor):
+    def blip_collator(processor, batch):
         """Colator for the 'blip2-opt-2.7b' model
         """
         # pad the input_ids and attention_mask
@@ -267,6 +271,7 @@ class BenetechDataset(Dataset):
                  processor,
                  dataset,
                  data_config: DataConfig, 
+                 model_architecture: str = 'matcha',
                  task: str = 'classify', 
                  stage: str = 'train'):
         
@@ -281,16 +286,25 @@ class BenetechDataset(Dataset):
         self.stage = stage
         self.processor = processor
         self.dataset = dataset
+        self.model_architecture = model_architecture
 
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        encoding = self.processor(images=Image.open(item["img_path"]), 
-                                  return_tensors="pt", 
-                                  add_special_tokens=True, 
-                                  max_patches=self.data_config.max_patches)
+        if self.model_architecture == 'google/matcha-chartqa':
+            encoding = self.processor(images=Image.open(item["img_path"]), 
+                                    text="What is the information in the chart?",
+                                    return_tensors="pt", 
+                                    add_special_tokens=True, 
+                                    max_patches=self.data_config.max_patches)
+            
+        elif self.model_architecture == 'ybelkada/pix2struct-base':
+            encoding = self.processor(images=Image.open(item["img_path"]), 
+                                    return_tensors="pt", 
+                                    add_special_tokens=True, 
+                                    max_patches=self.data_config.max_patches)
         
         encoding = {k:v.squeeze() for k,v in encoding.items()}
 
@@ -309,11 +323,16 @@ class BenetechDataset(Dataset):
 
 class CaptionGenerator:
     def __init__(self, 
-                 model_architecture: str = "Salesforce/blip2-opt-2.7b",
-                 lora_config: dict = {'r':8, 'lora_alpha':32, 'lora_dropout': 0.0, 'bias': None},
+                 model_architecture: str = "ybelkada/pix2struct-base",
+                 lora_config: dict = None,
                  model_config: dict = None,
                  device:str = 'cuda',
-                 optimizer_info:dict = {'name':'AdamW', 'lr': 5e-5, 'weight_decay': 0.01, 'eps': 1e-8},
+                 optimizer_info:dict = {'name':'Adafactor',
+                                        'optimizer_params':{'scale_parameter':False, 
+                                                            'relative_step':False, 
+                                                            'lr':0.01, 
+                                                            'weight_decay':1e-05}
+                                        },
                  source: str = 'pretrained',
                  task: str = 'full_output',
                  load_in_8bit: bool = True):
@@ -323,42 +342,61 @@ class CaptionGenerator:
         self.model_architecture = model_architecture
         self.source = source
         self.load_in_8bit = load_in_8bit
-        self.optmizer_info = optimizer_info
+        self.optimizer_info = optimizer_info
+        self.optimizer = None
 
         if model_architecture == "Salesforce/blip2-opt-2.7b":
             self.collator = DataTools.blip_collator
 
-        from peft import LoraConfig
-
+        elif (model_architecture == "google/matcha-chartqa") | (model_architecture == "ybelkada/pix2struct-base"):
+            self.collator = DataTools.pix2struct_collator
 
         if lora_config is not None:
+            from peft import LoraConfig
             self.config = LoraConfig(**lora_config)
 
         if model_config is not None:
             self.config = model_config
 
-    def load_model(self):
-        from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
-        from peft import get_peft_model
-
-        quantization_config = BitsAndBytesConfig(llm_int8_enable_fp32_cpu_offload=True)
+    def load_model(self, use_peft: bool = False):
+        from transformers import AutoProcessor
 
 
-        if self.source == 'pretrained':
+        if (self.source == 'pretrained') & (self.model_architecture == "Salesforce/blip2-opt-2.7b"):
+            from transformers import AutoModelForVision2Seq
+
             model = AutoModelForVision2Seq.from_pretrained(self.model_architecture, 
                                                            load_in_8bit=self.load_in_8bit,
                                                            device_map = 'auto')
             
             processor = AutoProcessor.from_pretrained(self.model_architecture)
 
-        self.model = get_peft_model(model, self.config)
-        self.processor = processor
-        self.model.print_trainable_parameters()
+        elif (self.source == 'pretrained') & (self.model_architecture == "ybelkada/pix2struct-base"):
+            from transformers import Pix2StructForConditionalGeneration
+            from transformers.optimization import Adafactor, get_cosine_schedule_with_warmup 
 
-        if self.optimizer['name'] == 'AdamW':
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.optimizer['lr'])
-        
-        return
+            model = Pix2StructForConditionalGeneration.from_pretrained(self.model_architecture).to(self.device)
+            processor = AutoProcessor.from_pretrained(self.model_architecture)
+
+        if use_peft:
+            from peft import get_peft_model
+            self.model = get_peft_model(model, self.config)
+            self.model.print_trainable_parameters()
+
+
+        else:
+            self.model = model
+
+        self.processor = processor
+
+        if self.optimizer_info['name'] == 'AdamW':
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.optimizer_info['optimizer_params']['lr'])
+
+        elif self.optimizer_info['name'] == 'Adafactor':
+            from transformers.optimization import Adafactor, get_cosine_schedule_with_warmup
+            self.optimizer = Adafactor(model.parameters(), **self.optimizer_info['optimizer_params'])
+            self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps=1000, num_training_steps=40000)
+
 
 class ModelExperiment:
     def __init__(self, 
@@ -386,21 +424,25 @@ class ModelExperiment:
                                         dataset = train_dataset,
                                         data_config = self.data_config,
                                         task = generator.task,
-                                        stage = 'train')
+                                        stage = 'train',
+                                        model_architecture=generator.model_architecture)
         
         train_dataloader = DataLoader(train_dataset, 
                                       shuffle=True, 
                                       batch_size=batch_size, 
-                                      collate_fn=generator.collator)
+                                      collate_fn=partial(generator.collator, generator.processor))
                 
         for epoch in range(epochs):
             print("Epoch:", epoch)
             for idx, batch in enumerate(train_dataloader):
-                input_ids = batch.pop("input_ids").to(generator.device)
-                pixel_values = batch.pop("pixel_values").to(generator.device, torch.float16)
+                labels = batch.pop("labels").to(generator.device)
+                flattened_patches = batch.pop("flattened_patches").to(generator.device)
+                attention_mask = batch.pop("attention_mask").to(generator.device)
 
-                outputs = generator.model(input_ids=input_ids, pixel_values=pixel_values, labels=input_ids)
-
+                outputs = generator.model(flattened_patches=flattened_patches,
+                                attention_mask=attention_mask,
+                                labels=labels)
+                
                 loss = outputs.loss
 
                 print("Loss:", loss.item())
@@ -410,9 +452,13 @@ class ModelExperiment:
                 generator.optimizer.step()
                 generator.optimizer.zero_grad()
 
-                if idx % 1000 == 0:
-                    generated_output = generator.model.generate(pixel_values=pixel_values)
-                    print(train_dataset.processor.batch_decode(generated_output, skip_special_tokens=True))
+                if (epoch + 1) % 20 == 0:
+                    generator.model.eval()
+
+                    predictions = generator.model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)        
+                    print("Predictions:", generator.processor.batch_decode(predictions, skip_special_tokens=True))
+
+                    generator.model.train()
 
         return
         
