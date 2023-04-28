@@ -390,12 +390,16 @@ class CaptionGenerator:
         self.processor = processor
 
         if self.optimizer_info['name'] == 'AdamW':
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=self.optimizer_info['optimizer_params']['lr'])
+            self.optimizer = torch.optim.AdamW(model.parameters(), 
+                                               lr=self.optimizer_info['optimizer_params']['lr'])
 
         elif self.optimizer_info['name'] == 'Adafactor':
             from transformers.optimization import Adafactor, get_cosine_schedule_with_warmup
             self.optimizer = Adafactor(model.parameters(), **self.optimizer_info['optimizer_params'])
-            self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, num_warmup_steps=1000, num_training_steps=40000)
+
+            self.scheduler = get_cosine_schedule_with_warmup(self.optimizer, 
+                                                             num_warmup_steps=1000, 
+                                                             num_training_steps=40000)
 
 
 class ModelExperiment:
@@ -455,8 +459,10 @@ class ModelExperiment:
                 if (epoch + 1) % 20 == 0:
                     generator.model.eval()
 
-                    predictions = generator.model.generate(flattened_patches=flattened_patches, attention_mask=attention_mask)        
-                    print("Predictions:", generator.processor.batch_decode(predictions, skip_special_tokens=True))
+                    predictions = generator.model.generate(flattened_patches=flattened_patches, 
+                                                           attention_mask=attention_mask)        
+                    print("Predictions:", generator.processor.batch_decode(predictions, 
+                                                                           skip_special_tokens=True))
 
                     generator.model.train()
 
