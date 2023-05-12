@@ -230,11 +230,11 @@ class DataTools:
         texts = [item["text"] for item in batch]
         
         text_inputs = processor(text=texts, 
-                                padding="max_length", 
+                                padding=True, 
                                 return_tensors="pt", 
                                 add_special_tokens=True, 
-                                #truncation=True,
-                                max_length=100)
+                                truncation=True,
+                                max_length=200)
         
         new_batch["labels"] = text_inputs.input_ids
         
@@ -271,8 +271,8 @@ class BenetechDataset(Dataset):
                  processor,
                  dataset,
                  data_config: DataConfig, 
-                 model_architecture: str = 'matcha',
-                 task: str = 'classify', 
+                 model_architecture: str = 'ybelkada/pix2struct-base',
+                 task: str = 'full_output', 
                  stage: str = 'train'):
         
 
@@ -280,41 +280,36 @@ class BenetechDataset(Dataset):
             raise ValueError('Task must be either classify, extract_x, extract_y or full_output')
         if stage not in ['train', 'val', 'test']:
             raise ValueError('Stage must be either train, val or test')
-
+        
         self.data_config = data_config
         self.task = task
         self.stage = stage
         self.processor = processor
         self.dataset = dataset
-        self.model_architecture = model_architecture
 
     def __len__(self):
         return len(self.dataset)
     
-    def __getitem__(self, idx):
+    def __getitem__(self, idx):  
+        #identify the datapoint          
         item = self.dataset[idx]
-        if self.model_architecture == 'google/matcha-chartqa':
-            encoding = self.processor(images=Image.open(item["img_path"]), 
-                                    text="What is the information in the chart?",
-                                    return_tensors="pt", 
-                                    add_special_tokens=True, 
-                                    max_patches=self.data_config.max_patches)
-            
-        elif self.model_architecture == 'ybelkada/pix2struct-base':
-            encoding = self.processor(images=Image.open(item["img_path"]), 
-                                    return_tensors="pt", 
-                                    add_special_tokens=True, 
-                                    max_patches=self.data_config.max_patches)
-        
-        encoding = {k:v.squeeze() for k,v in encoding.items()}
 
+        #get text from annotations file
         annotations = DataTools.load_json(item["annotations_path"])
         chart_type, x_series, y_series = DataTools.transform_data_series(annotations)
-
         text = DataTools.textify(chart_type, x_series, y_series, task=self.task)
 
-        encoding["text"] = text
+        #Read image in grayscale from annotations image path
+        img = Image.open(item["img_path"]).convert('L')
+        encoding = self.processor(images= img, 
+                                  return_tensors="pt", 
+                                  add_special_tokens=True, 
+                                  max_patches=self.data_config.max_patches)
         
+
+        encoding = {k:v.squeeze() for k,v in encoding.items()}
+        encoding["text"] = text
+
         return encoding
     
 
@@ -333,9 +328,12 @@ class CaptionGenerator:
                                                             'lr':0.01, 
                                                             'weight_decay':1e-05}
                                         },
+
                  source: str = 'pretrained',
                  task: str = 'full_output',
                  load_in_8bit: bool = True):
+        
+        assert model_architecture == 'ybelkada/pix2struct-base', 'Invalid model architecture'
 
         self.device = device
         self.task = task
@@ -344,12 +342,7 @@ class CaptionGenerator:
         self.load_in_8bit = load_in_8bit
         self.optimizer_info = optimizer_info
         self.optimizer = None
-
-        if model_architecture == "Salesforce/blip2-opt-2.7b":
-            self.collator = DataTools.blip_collator
-
-        elif (model_architecture == "google/matcha-chartqa") | (model_architecture == "ybelkada/pix2struct-base"):
-            self.collator = DataTools.pix2struct_collator
+        self.collator = DataTools.pix2struct_collator
 
         if lora_config is not None:
             from peft import LoraConfig
@@ -361,15 +354,8 @@ class CaptionGenerator:
     def load_model(self, use_peft: bool = False):
         from transformers import AutoProcessor
 
-
         if (self.source == 'pretrained') & (self.model_architecture == "Salesforce/blip2-opt-2.7b"):
-            from transformers import AutoModelForVision2Seq
-
-            model = AutoModelForVision2Seq.from_pretrained(self.model_architecture, 
-                                                           load_in_8bit=self.load_in_8bit,
-                                                           device_map = 'auto')
-            
-            processor = AutoProcessor.from_pretrained(self.model_architecture)
+            pass
 
         elif (self.source == 'pretrained') & (self.model_architecture == "ybelkada/pix2struct-base"):
             from transformers import Pix2StructForConditionalGeneration
@@ -428,8 +414,8 @@ class ModelExperiment:
                                         dataset = train_dataset,
                                         data_config = self.data_config,
                                         task = generator.task,
-                                        stage = 'train',
-                                        model_architecture=generator.model_architecture)
+                                        stage = 'train'
+                                        )
         
         train_dataloader = DataLoader(train_dataset, 
                                       shuffle=True, 
