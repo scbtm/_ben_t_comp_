@@ -402,7 +402,8 @@ class CaptionGenerator:
             from transformers import Pix2StructForConditionalGeneration
             from transformers.optimization import Adafactor, get_cosine_schedule_with_warmup 
 
-            model = Pix2StructForConditionalGeneration.from_pretrained(self.model_architecture).to(self.device)
+            model = Pix2StructForConditionalGeneration.from_pretrained(self.model_architecture,
+                                                                       is_encoder_decoder=True).to(self.device)
             processor = AutoProcessor.from_pretrained(self.model_architecture)
 
         if use_peft:
